@@ -37,6 +37,10 @@
   },
   "Traders": {
     "TraderOne": "secret",
-    "MarketMaking": "secret"
+    "StatArbNaive": "secret",
+    "StatArbFull" : "secret",
+    "MarketMaking_T2":"secret",
+    "MarketMakingDyn":"secret",
+    "MarketMaking":"secret"
   }
 }
