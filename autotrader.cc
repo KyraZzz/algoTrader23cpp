@@ -27,13 +27,16 @@ using namespace ReadyTraderGo;
 
 RTG_INLINE_GLOBAL_LOGGER_WITH_CHANNEL(LG_AT, "AUTO")
 
-constexpr int LOT_SIZE = 10;
-constexpr int POSITION_LIMIT = 100;
-constexpr int TICK_SIZE_IN_CENTS = 100;
-constexpr int MIN_BID_NEARST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) / TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS;
-constexpr int MAX_ASK_NEAREST_TICK = MAXIMUM_ASK / TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS;
+constexpr signed long MAX_LOT_SIZE = 25;
+constexpr signed long POSITION_LIMIT = 100;
+constexpr signed long TICK_SIZE_IN_CENTS = 100;
+constexpr signed long MIN_BID_NEARST_TICK = (MINIMUM_BID + TICK_SIZE_IN_CENTS) / TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS;
+constexpr signed long MAX_ASK_NEAREST_TICK = MAXIMUM_ASK / TICK_SIZE_IN_CENTS * TICK_SIZE_IN_CENTS;
+constexpr float THRESHOLD = 5e-4;
+// constexpr signed long ACTIVE_VOLUME_LIMIT = 200;
+constexpr signed long ACTIVE_ORDERS_LIMIT = 10;
 
-AutoTrader::AutoTrader(boost::asio::io_context& context) : BaseAutoTrader(context)
+AutoTrader::AutoTrader(boost::asio::io_context &context) : BaseAutoTrader(context)
 {
 }
 
@@ -44,7 +47,7 @@ void AutoTrader::DisconnectHandler()
 }
 
 void AutoTrader::ErrorMessageHandler(unsigned long clientOrderId,
-                                     const std::string& errorMessage)
+                                     const std::string &errorMessage)
 {
     RLOG(LG_AT, LogLevel::LL_INFO) << "error with order " << clientOrderId << ": " << errorMessage;
     if (clientOrderId != 0 && ((mAsks.count(clientOrderId) == 1) || (mBids.count(clientOrderId) == 1)))
@@ -63,10 +66,10 @@ void AutoTrader::HedgeFilledMessageHandler(unsigned long clientOrderId,
 
 void AutoTrader::OrderBookMessageHandler(Instrument instrument,
                                          unsigned long sequenceNumber,
-                                         const std::array<unsigned long, TOP_LEVEL_COUNT>& askPrices,
-                                         const std::array<unsigned long, TOP_LEVEL_COUNT>& askVolumes,
-                                         const std::array<unsigned long, TOP_LEVEL_COUNT>& bidPrices,
-                                         const std::array<unsigned long, TOP_LEVEL_COUNT>& bidVolumes)
+                                         const std::array<unsigned long, TOP_LEVEL_COUNT> &askPrices,
+                                         const std::array<unsigned long, TOP_LEVEL_COUNT> &askVolumes,
+                                         const std::array<unsigned long, TOP_LEVEL_COUNT> &bidPrices,
+                                         const std::array<unsigned long, TOP_LEVEL_COUNT> &bidVolumes)
 {
     RLOG(LG_AT, LogLevel::LL_INFO) << "order book received for " << instrument << " instrument"
                                    << ": ask prices: " << askPrices[0]
@@ -74,36 +77,110 @@ void AutoTrader::OrderBookMessageHandler(Instrument instrument,
                                    << "; bid prices: " << bidPrices[0]
                                    << "; bid volumes: " << bidVolumes[0];
 
+    if (instrument == Instrument::ETF)
+    {
+        for (int i = 0; i < sizeof(bidPrices) / sizeof(signed long); i++)
+        {
+            topBidDic[instrument][i] = std::make_pair(bidPrices[i], bidVolumes[i]);
+        }
+        for (int i = 0; i < sizeof(askPrices) / sizeof(signed long); i++)
+        {
+            topAskDic[instrument][i] = std::make_pair(askPrices[i], askVolumes[i]);
+        }
+        signed long f_ask_p0 = topAskDic[Instrument::FUTURE][0].first;
+        signed long f_bid_p0 = topBidDic[Instrument::FUTURE][0].first;
+        signed long e_ask_p0 = topAskDic[Instrument::ETF][0].first;
+        signed long e_bid_p0 = topBidDic[Instrument::ETF][0].first;
+
+        // entry signal
+        if (mActiveOrders < ACTIVE_ORDERS_LIMIT && topBidDic.count(Instrument::FUTURE) > 0 && topAskDic.count(Instrument::FUTURE) > 0)
+        {
+            if (mPotBid < POSITION_LIMIT && f_bid_p0 - (e_bid_p0 + TICK_SIZE_IN_CENTS) >= THRESHOLD * (e_bid_p0 + TICK_SIZE_IN_CENTS))
+            {
+                signed long volume = std::min(MAX_LOT_SIZE, POSITION_LIMIT - mPotBid);
+                if (volume > 0)
+                {
+                    mBidId = mNextMessageId++;
+                    signed long price = e_bid_p0 + TICK_SIZE_IN_CENTS;
+                    SendInsertOrder(mBidId, Side::BUY, price, volume, Lifespan::GOOD_FOR_DAY);
+                    mBids.insert(mBidId);
+                    BidOrder new_order(mBidId, price, volume, false);
+                    orderMap[mBidId] = new_order;
+                    mPotBid += volume;
+                    mActiveOrders += 1;
+                }
+            }
+            if (mPotAsk > -POSITION_LIMIT && (e_ask_p0 - TICK_SIZE_IN_CENTS) - f_ask_p0 >= THRESHOLD * f_ask_p0)
+            {
+                signed long volume = std::min(MAX_LOT_SIZE, POSITION_LIMIT + mPotAsk);
+                if (volume > 0)
+                {
+                    mAskId = mNextMessageId++;
+                    signed long price = e_ask_p0 - TICK_SIZE_IN_CENTS;
+                    SendInsertOrder(mAskId, Side::SELL, price, volume, Lifespan::GOOD_FOR_DAY);
+                    mAsks.insert(mAskId);
+                    AskOrder new_order(mAskId, price, volume, false);
+                    orderMap[mAskId] = new_order;
+                    mPotAsk -= volume;
+                    mActiveOrders += 1;
+                }
+            }
+        }
+
+        // cancel orders signal
+        if (f_bid_p0 - (e_bid_p0 + TICK_SIZE_IN_CENTS) < THRESHOLD * (e_bid_p0 + TICK_SIZE_IN_CENTS))
+        {
+            for (signed long bid : mBids)
+            {
+                SendCancelOrder(bid);
+            }
+        }
+        if ((e_ask_p0 - TICK_SIZE_IN_CENTS) - f_ask_p0 < THRESHOLD * f_ask_p0)
+        {
+            for (signed long ask : mAsks)
+            {
+                SendCancelOrder(ask);
+            }
+        }
+
+        // Exit signal
+        signed long volume = std::abs(mPosition);
+
+        // When we have long ETF and we need to sell it
+        if (mPosition > 0 && e_bid_p0 > f_ask_p0 && mActiveOrders < ACTIVE_ORDERS_LIMIT)
+        {
+            mAskId = mNextMessageId++; // Assuming you have a function to get the next order ID
+            // Send order
+            SendInsertOrder(mAskId, Side::SELL, e_bid_p0, volume, Lifespan::FILL_AND_KILL); // Assuming Side and Lifespan are defined
+            // Update bookkeeping
+            mAsks.insert(mAskId);
+            AskOrder new_order(mAskId, e_bid_p0, volume, true);
+            orderMap[mAskId] = new_order;
+            mActiveOrders += 1;
+        }
+        // When we have short ETF and we need to buy it
+        else if (mPosition < 0 && f_bid_p0 > e_ask_p0 && mActiveOrders < ACTIVE_ORDERS_LIMIT)
+        {
+            mBidId = mNextMessageId++; // Assuming you have a function to get the next order ID
+            // Send order
+            SendInsertOrder(mBidId, Side::BUY, e_ask_p0, volume, Lifespan::FILL_AND_KILL); // Assuming Side and Lifespan are defined
+            // Update bookkeeping
+            mBids.insert(mBidId);
+            BidOrder new_order(mBidId, e_ask_p0, volume, true);
+            orderMap[mBidId] = new_order;
+            mActiveOrders += 1;
+        }
+    }
+
     if (instrument == Instrument::FUTURE)
     {
-        unsigned long priceAdjustment = - (mPosition / LOT_SIZE) * TICK_SIZE_IN_CENTS;
-        unsigned long newAskPrice = (askPrices[0] != 0) ? askPrices[0] + priceAdjustment : 0;
-        unsigned long newBidPrice = (bidPrices[0] != 0) ? bidPrices[0] + priceAdjustment : 0;
-
-        if (mAskId != 0 && newAskPrice != 0 && newAskPrice != mAskPrice)
+        for (int i = 0; i < sizeof(bidPrices) / sizeof(signed long); i++)
         {
-            SendCancelOrder(mAskId);
-            mAskId = 0;
+            topBidDic[instrument][i] = std::make_pair(bidPrices[i], bidVolumes[i]);
         }
-        if (mBidId != 0 && newBidPrice != 0 && newBidPrice != mBidPrice)
+        for (int i = 0; i < sizeof(askPrices) / sizeof(signed long); i++)
         {
-            SendCancelOrder(mBidId);
-            mBidId = 0;
-        }
-
-        if (mAskId == 0 && newAskPrice != 0 && mPosition > -POSITION_LIMIT)
-        {
-            mAskId = mNextMessageId++;
-            mAskPrice = newAskPrice;
-            SendInsertOrder(mAskId, Side::SELL, newAskPrice, LOT_SIZE, Lifespan::GOOD_FOR_DAY);
-            mAsks.emplace(mAskId);
-        }
-        if (mBidId == 0 && newBidPrice != 0 && mPosition < POSITION_LIMIT)
-        {
-            mBidId = mNextMessageId++;
-            mBidPrice = newBidPrice;
-            SendInsertOrder(mBidId, Side::BUY, newBidPrice, LOT_SIZE, Lifespan::GOOD_FOR_DAY);
-            mBids.emplace(mBidId);
+            topAskDic[instrument][i] = std::make_pair(askPrices[i], askVolumes[i]);
         }
     }
 }
@@ -114,15 +191,39 @@ void AutoTrader::OrderFilledMessageHandler(unsigned long clientOrderId,
 {
     RLOG(LG_AT, LogLevel::LL_INFO) << "order " << clientOrderId << " filled for " << volume
                                    << " lots at $" << price << " cents";
-    if (mAsks.count(clientOrderId) == 1)
+
+    if (mBids.find(clientOrderId) != mBids.end())
     {
-        mPosition -= (long)volume;
-        SendHedgeOrder(mNextMessageId++, Side::BUY, MAX_ASK_NEAREST_TICK, volume);
+        SendHedgeOrder(mNextMessageId++, Side::SELL, MIN_BID_NEARST_TICK, volume); // Assuming getNextOrderId() and Side are defined
+        mPosition += volume;
+        mPotAsk += volume;
     }
-    else if (mBids.count(clientOrderId) == 1)
+    else if (mAsks.find(clientOrderId) != mAsks.end())
     {
-        mPosition += (long)volume;
-        SendHedgeOrder(mNextMessageId++, Side::SELL, MIN_BID_NEARST_TICK, volume);
+        SendHedgeOrder(mNextMessageId++, Side::BUY, MAX_ASK_NEAREST_TICK, volume); // Assuming getNextOrderId() and Side are defined
+        mPosition -= volume;
+        mPotBid -= volume;
+    }
+
+    Order &order = orderMap[clientOrderId];
+    // Case 3: not FAK and fully filled
+    if (order.FAK == false && volume == order.volume)
+    {
+        if (mBids.find(clientOrderId) != mBids.end())
+        {
+            mBids.erase(clientOrderId);
+        }
+        else if (mAsks.find(clientOrderId) != mAsks.end())
+        {
+            mAsks.erase(clientOrderId);
+        }
+        mActiveOrders -= 1;
+    }
+    // Case 4: partially filled
+    else if (order.FAK == false && volume < order.volume)
+    {
+        signed long remainingVolume = order.volume - volume;
+        order.amend_volume(remainingVolume);
     }
 }
 
@@ -131,28 +232,47 @@ void AutoTrader::OrderStatusMessageHandler(unsigned long clientOrderId,
                                            unsigned long remainingVolume,
                                            signed long fees)
 {
-    if (remainingVolume == 0)
+    Order &order = orderMap[clientOrderId];
+    // case 1: self cancelled order
+    if (!order.FAK && remainingVolume == 0)
     {
-        if (clientOrderId == mAskId)
+        // It could be either a bid or an ask
+        if (mBids.find(clientOrderId) != mBids.end())
         {
-            mAskId = 0;
+            mPotBid -= order.volume;
         }
-        else if (clientOrderId == mBidId)
+        else if (mAsks.find(clientOrderId) != mAsks.end())
         {
-            mBidId = 0;
+            mPotAsk += order.volume;
         }
-
-        mAsks.erase(clientOrderId);
         mBids.erase(clientOrderId);
+        mAsks.erase(clientOrderId);
+        mActiveOrders--;
+
+        // case 2: FAK
+    }
+    else if (order.FAK)
+    {
+        if (mBids.find(clientOrderId) != mBids.end())
+        {
+            mPotBid += fillVolume;
+            mBids.erase(clientOrderId);
+        }
+        else if (mAsks.find(clientOrderId) != mAsks.end())
+        {
+            mPotAsk -= fillVolume;
+            mAsks.erase(clientOrderId);
+        }
+        mActiveOrders--;
     }
 }
 
 void AutoTrader::TradeTicksMessageHandler(Instrument instrument,
                                           unsigned long sequenceNumber,
-                                          const std::array<unsigned long, TOP_LEVEL_COUNT>& askPrices,
-                                          const std::array<unsigned long, TOP_LEVEL_COUNT>& askVolumes,
-                                          const std::array<unsigned long, TOP_LEVEL_COUNT>& bidPrices,
-                                          const std::array<unsigned long, TOP_LEVEL_COUNT>& bidVolumes)
+                                          const std::array<unsigned long, TOP_LEVEL_COUNT> &askPrices,
+                                          const std::array<unsigned long, TOP_LEVEL_COUNT> &askVolumes,
+                                          const std::array<unsigned long, TOP_LEVEL_COUNT> &bidPrices,
+                                          const std::array<unsigned long, TOP_LEVEL_COUNT> &bidVolumes)
 {
     RLOG(LG_AT, LogLevel::LL_INFO) << "trade ticks received for " << instrument << " instrument"
                                    << ": ask prices: " << askPrices[0]

@@ -22,16 +22,86 @@
 #include <memory>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
+#include <utility>
+#include <iostream>
 
 #include <boost/asio/io_context.hpp>
 
 #include <ready_trader_go/baseautotrader.h>
 #include <ready_trader_go/types.h>
 
+// Order class
+class Order
+{
+public:
+    Order(int order_id, int price, int volume, bool FAK = false)
+        : order_id(order_id), price(price), volume(volume), FAK(FAK) {}
+
+public:
+    // Default constructor
+    Order()
+    {
+        // Set default values for member variables
+        order_id = 0;
+        price = 0;
+        volume = 0;
+        FAK = false;
+    }
+    int order_id;
+    int price;
+    int volume;
+    bool FAK;
+    void amend_volume(int new_volume)
+    {
+        volume = new_volume;
+    }
+};
+
+// BidOrder class
+class BidOrder : public Order
+{
+public:
+    BidOrder(int order_id, int price, int volume, bool FAK = false)
+        : Order(order_id, price, volume, FAK) {}
+    bool operator<(const BidOrder &other) const
+    {
+        if (price > other.price)
+        {
+            return true;
+        }
+        else if (price == other.price && order_id < other.order_id)
+        {
+            return true;
+        }
+        return false;
+    }
+};
+
+// AskOrder class
+class AskOrder : public Order
+{
+public:
+    AskOrder(int order_id, int price, int volume, bool FAK = false)
+        : Order(order_id, price, volume, FAK) {}
+    bool operator<(const AskOrder &other) const
+    {
+        if (price < other.price)
+        {
+            return true;
+        }
+        else if (price == other.price && order_id < other.order_id)
+        {
+            return true;
+        }
+        return false;
+    }
+};
+
 class AutoTrader : public ReadyTraderGo::BaseAutoTrader
 {
 public:
-    explicit AutoTrader(boost::asio::io_context& context);
+    explicit AutoTrader(boost::asio::io_context &context);
 
     // Called when the execution connection is lost.
     void DisconnectHandler() override;
@@ -40,7 +110,7 @@ public:
     // If the error pertains to a particular order, then the client_order_id
     // will identify that order, otherwise the client_order_id will be zero.
     void ErrorMessageHandler(unsigned long clientOrderId,
-                             const std::string& errorMessage) override;
+                             const std::string &errorMessage) override;
 
     // Called when one of your hedge orders is filled, partially or fully.
     //
@@ -60,10 +130,10 @@ public:
     // price levels.
     void OrderBookMessageHandler(ReadyTraderGo::Instrument instrument,
                                  unsigned long sequenceNumber,
-                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& askPrices,
-                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& askVolumes,
-                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& bidPrices,
-                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& bidVolumes) override;
+                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &askPrices,
+                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &askVolumes,
+                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &bidPrices,
+                                 const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &bidVolumes) override;
 
     // Called when one of your orders is filled, partially or fully.
     void OrderFilledMessageHandler(unsigned long clientOrderId,
@@ -88,10 +158,10 @@ public:
     // the end of both the prices and volumes arrays.
     void TradeTicksMessageHandler(ReadyTraderGo::Instrument instrument,
                                   unsigned long sequenceNumber,
-                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& askPrices,
-                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& askVolumes,
-                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& bidPrices,
-                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT>& bidVolumes) override;
+                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &askPrices,
+                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &askVolumes,
+                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &bidPrices,
+                                  const std::array<unsigned long, ReadyTraderGo::TOP_LEVEL_COUNT> &bidVolumes) override;
 
 private:
     unsigned long mNextMessageId = 1;
@@ -100,8 +170,14 @@ private:
     unsigned long mBidId = 0;
     unsigned long mBidPrice = 0;
     signed long mPosition = 0;
+    signed long mActiveOrders = 0;
+    signed long mPotBid = 0;
+    signed long mPotAsk = 0;
     std::unordered_set<unsigned long> mAsks;
     std::unordered_set<unsigned long> mBids;
+    std::unordered_map<ReadyTraderGo::Instrument, std::array<std::pair<signed long, signed long>, 5>> topBidDic;
+    std::unordered_map<ReadyTraderGo::Instrument, std::array<std::pair<signed long, signed long>, 5>> topAskDic;
+    std::unordered_map<signed long, Order> orderMap;
 };
 
-#endif //CPPREADY_TRADER_GO_AUTOTRADER_H
+#endif // CPPREADY_TRADER_GO_AUTOTRADER_H
